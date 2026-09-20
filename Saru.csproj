@@ -1,0 +1,21 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <Version>1.0.3.1</Version>
+    <AssemblyName>Saru</AssemblyName>
+    <RootNamespace>Saru</RootNamespace>
+    <Authors>Valenth</Authors>
+    <PackageProjectUrl>https://github.com/NeoGriever/Saru</PackageProjectUrl>
+    <Description>JavaScript automation scripts and collected object information.</Description>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <OutputPath>bin\$(Configuration)\</OutputPath>
+    <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Jint" Version="4.2.0" />
+    <Content Include="images/icon.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+</Project>
