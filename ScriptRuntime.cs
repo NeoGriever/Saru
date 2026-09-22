@@ -1,10 +1,13 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Linq;
 using System.Numerics;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using Dalamud.Plugin;
 using Jint;
 using Jint.Native;
 using Jint.Native.Object;
@@ -54,6 +57,7 @@ public sealed class ScriptRuntime : IDisposable
         engine.SetValue("CardSourceNPCs", cardSourceNpcs);
         engine.SetValue("Saucy", new SaucyApi(cardSourceNpcs));
         engine.SetValue("chocoholic", new ChocoholicApi());
+        engine.SetValue("Plugin", new Func<string, PluginApi>(name => new PluginApi(name, write)));
         engine.SetValue("saru", configApi);
         engine.SetValue("addEventListener", new Action<string, JsValue>(AddEventListener));
         engine.SetValue("Exit", new Action(Exit));
@@ -315,6 +319,134 @@ public sealed class ScriptRuntime : IDisposable
     {
         public bool Toggle(bool enabled) => Plugin.Instance.ToggleChocoholic(enabled);
         public bool SetNumberOfRaces(int numberOfRaces) => Plugin.Instance.SetChocoholicNumberOfRaces(numberOfRaces);
+    }
+    private sealed class PluginApi(string name, Action<LogLevel, string> write)
+    {
+        private readonly string name = name;
+        private readonly Action<LogLevel, string> write = write;
+        public object? IPC(string ipcName, ObjectInstance? arguments = null)
+        {
+            var assembly = FindAssembly();
+            if (assembly == null) return null;
+            var values = ReadArguments(arguments);
+            try
+            {
+                var getter = typeof(IDalamudPluginInterface).GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(method => method.Name == "GetIpcSubscriber" && method.IsGenericMethodDefinition && method.GetGenericArguments().Length == values.Length + 1);
+                if (getter == null) return IpcUnavailable(ipcName);
+                var subscriber = getter.MakeGenericMethod(Enumerable.Repeat(typeof(object), values.Length + 1).ToArray()).Invoke(Plugin.PluginInterface, [ipcName]);
+                if (subscriber == null) return IpcUnavailable(ipcName);
+                var subscriberType = subscriber.GetType();
+                var hasAction = subscriberType.GetProperty("HasAction")?.GetValue(subscriber) as bool? == true;
+                var hasFunction = subscriberType.GetProperty("HasFunction")?.GetValue(subscriber) as bool? == true;
+                if (!hasAction && !hasFunction) return IpcUnavailable(ipcName);
+                var methodName = hasFunction ? "InvokeFunc" : "InvokeAction";
+                var invoke = subscriberType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(method => method.Name == methodName && method.GetParameters().Length == values.Length);
+                if (invoke == null) return IpcUnavailable(ipcName);
+                return invoke.Invoke(subscriber, values);
+            }
+            catch (Exception ex)
+            {
+                write(LogLevel.Error, $"IPC '{ipcName}' is not available for plugin '{name}': {ex.GetBaseException().Message}");
+                return null;
+            }
+        }
+        public object? Reflect(string target, ObjectInstance? arguments = null)
+        {
+            var assembly = FindAssembly();
+            if (assembly == null) return null;
+            var values = ReadArguments(arguments);
+            try
+            {
+                var parts = target.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                var type = default(Type);
+                var memberStart = 0;
+                for (var count = parts.Length - 1; count > 0; count--)
+                {
+                    type = assembly.GetType(string.Join('.', parts.Take(count)), throwOnError: false, ignoreCase: false);
+                    if (type != null) { memberStart = count; break; }
+                }
+                if (type == null || memberStart >= parts.Length) return ReflectionUnavailable(target);
+                object? instance = null;
+                for (var index = memberStart; index < parts.Length - 1; index++)
+                {
+                    var flags = BindingFlags.Public | BindingFlags.FlattenHierarchy | (instance == null ? BindingFlags.Static : BindingFlags.Instance);
+                    var field = type.GetField(parts[index], flags);
+                    if (field != null) instance = field.GetValue(instance);
+                    else
+                    {
+                        var property = type.GetProperty(parts[index], flags);
+                        if (property == null) return ReflectionUnavailable(target);
+                        instance = property.GetValue(instance);
+                    }
+                    if (instance == null) return ReflectionUnavailable(target);
+                    type = instance.GetType();
+                }
+                var methodFlags = BindingFlags.Public | BindingFlags.FlattenHierarchy | (instance == null ? BindingFlags.Static : BindingFlags.Instance);
+                foreach (var method in type.GetMethods(methodFlags).Where(method => method.Name == parts[^1] && method.GetParameters().Length == values.Length))
+                {
+                    if (!TryConvertArguments(method.GetParameters(), values, out var converted)) continue;
+                    return method.Invoke(instance, converted);
+                }
+                return ReflectionUnavailable(target);
+            }
+            catch (Exception ex)
+            {
+                write(LogLevel.Error, $"Reflection target '{target}' is not available for plugin '{name}': {ex.GetBaseException().Message}");
+                return null;
+            }
+        }
+        private Assembly? FindAssembly()
+        {
+            var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => string.Equals(value.GetName().Name, name, StringComparison.OrdinalIgnoreCase));
+            if (assembly == null) write(LogLevel.Error, $"Plugin not found: '{name}'.");
+            return assembly;
+        }
+        private object? IpcUnavailable(string ipcName) { write(LogLevel.Error, $"IPC not available: '{ipcName}' for plugin '{name}'."); return null; }
+        private object? ReflectionUnavailable(string target) { write(LogLevel.Error, $"Reflection target not available: '{target}' for plugin '{name}'."); return null; }
+        private static object?[] ReadArguments(ObjectInstance? arguments)
+        {
+            if (arguments == null) return [];
+            var length = arguments.Get("length");
+            if (!length.IsNumber()) return [];
+            var result = new object?[(int)length.AsNumber()];
+            for (var index = 0; index < result.Length; index++) result[index] = ToHostValue(arguments.Get(index.ToString(CultureInfo.InvariantCulture)));
+            return result;
+        }
+        private static object? ToHostValue(JsValue value)
+        {
+            if (value.IsNull() || value.IsUndefined()) return null;
+            if (value.IsBoolean()) return value.AsBoolean();
+            if (value.IsNumber()) return value.AsNumber();
+            if (value.IsString()) return value.AsString();
+            return value.ToObject();
+        }
+        private static bool TryConvertArguments(ParameterInfo[] parameters, object?[] values, out object?[] converted)
+        {
+            converted = new object?[values.Length];
+            for (var index = 0; index < values.Length; index++)
+                if (!TryConvertArgument(values[index], parameters[index].ParameterType, out converted[index])) return false;
+            return true;
+        }
+        private static bool TryConvertArgument(object? value, Type destination, out object? converted)
+        {
+            var target = Nullable.GetUnderlyingType(destination) ?? destination;
+            if (value == null) { converted = target.IsValueType && Nullable.GetUnderlyingType(destination) == null ? null : null; return !target.IsValueType || Nullable.GetUnderlyingType(destination) != null; }
+            if (target.IsInstanceOfType(value)) { converted = value; return true; }
+            try
+            {
+                if (target.IsEnum)
+                {
+                    converted = value is string text ? Enum.Parse(target, text, ignoreCase: true) : Enum.ToObject(target, Convert.ChangeType(value, Enum.GetUnderlyingType(target), CultureInfo.InvariantCulture)!);
+                    return true;
+                }
+                if (value is double number && target != typeof(double) && Math.Abs(number % 1) > double.Epsilon && target != typeof(float) && target != typeof(decimal)) { converted = null; return false; }
+                converted = Convert.ChangeType(value, target, CultureInfo.InvariantCulture);
+                return true;
+            }
+            catch { converted = null; return false; }
+        }
     }
     private sealed class NavmeshApi
     {

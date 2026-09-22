@@ -8,6 +8,7 @@ using System.IO;
 using System.Numerics;
 using System.Security.Cryptography;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
@@ -29,6 +30,13 @@ using ClientUIModule = FFXIVClientStructs.FFXIV.Client.UI.UIModule;
 namespace Saru;
 public sealed class Plugin : IDalamudPlugin
 {
+    private const float InteractionCameraMaximumDistance = 6f;
+    [StructLayout(LayoutKind.Explicit, Size = 0x12C)]
+    private struct InteractionCamera
+    {
+        [FieldOffset(0x124)] public float CurrentZoom;
+        [FieldOffset(0x128)] public float MinimumZoom;
+    }
     internal static Plugin Instance { get; private set; } = null!;
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
@@ -279,7 +287,15 @@ public sealed class Plugin : IDalamudPlugin
     }
     private void DisableCammyNoClippy()
     {
-        TrySetCammyCameraClipping(true, out _);
+        if (TrySetCammyCameraClipping(true, out _)) BringCameraCloserForInteraction();
+    }
+    private static unsafe void BringCameraCloserForInteraction()
+    {
+        var manager = CameraManager.Instance();
+        if (manager == null) return;
+        var camera = *(InteractionCamera**)manager;
+        if (camera == null || camera->CurrentZoom <= InteractionCameraMaximumDistance) return;
+        camera->CurrentZoom = Math.Max(camera->MinimumZoom, InteractionCameraMaximumDistance);
     }
     public bool TrySetCammyCameraClipping(bool clippingEnabled, out string status)
     {

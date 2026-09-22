@@ -73,7 +73,7 @@ vNavMesh.MoveTo({ x: 12.5, y: 3.0, z: -42.75, mapId: 144 }, 1.5);
 vNavMesh.IsRunning();
 ```
 
-The final `MoveTo` argument is the arrival buffer. `mapId` is optional: without it movement behaves as before; with it, the move is rejected unless the player is on that map, and `arrived` cannot fire on another map. `target.Activate` disables Cammy camera no-clipping through Cammy’s loaded public API before the interaction.
+The final `MoveTo` argument is the arrival buffer. `mapId` is optional: without it movement behaves as before; with it, the move is rejected unless the player is on that map, and `arrived` cannot fire on another map. When Cammy is loaded, `target.Activate` restores normal camera collision before the interaction and reduces an overly distant current camera zoom to at most 6 yalms. A nearer user-selected zoom is not changed.
 
 ## Chocoholic
 
@@ -86,6 +86,19 @@ chocoholic.SetNumberOfRaces(1); // set Number of races (clamped to 0–999)
 ```
 
 `Toggle` returns `false` if Chocoholic is not loaded or its compatible activation state is unavailable. Chocoholic currently exposes no general start/stop IPC, so Saru sets the same internal `DutyRestart.Enabled` state that its **Start Racing**/**Stop Racing** button uses through reflection.
+
+`GoldSaucerRunner.js` uses `SetNumberOfRaces(1)` for each queue. Its configurable GATE deadzone does not call `Toggle(false)` and therefore never interrupts a race. Chocoholic is turned off only after the race's MGP payout is detected; the following queue check then leaves it off when the deadzone has begun.
+
+## Dynamic plugin integration
+
+Use `Plugin(internalName)` to call optional integrations without making them Saru dependencies:
+
+```js
+Plugin("SomePlugin").IPC("SomePlugin.Command", [true, 5]);
+Plugin("Chocoholic").Reflect("Chocoholic.Chocorunner.C.Enable", []);
+```
+
+`IPC(name, arguments)` invokes a Dalamud IPC endpoint with up to eight primitive arguments. `Reflect(target, arguments)` resolves public types, fields/properties, and a public method. Both calls return the invoked result or `null` and never stop the script. Missing plugins write `plugin not found` to `/xllog`; unavailable IPC endpoints write `ipc not available`; invalid reflection targets are also logged and act as no-ops.
 
 ## Dialogs and chat
 
