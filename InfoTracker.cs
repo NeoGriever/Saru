@@ -17,11 +17,11 @@ public sealed class InfoTracker
 
     public void SetActive(bool active) => IsActive = active;
 
-    public void Update()
+    public void Update(uint mapId)
     {
         if (!IsActive) return;
         var targetId = Plugin.TargetManager.Target?.GameObjectId ?? 0;
-        foreach (var obj in Plugin.ObjectTable) UpdateObject(obj, targetId);
+        foreach (var obj in Plugin.ObjectTable) UpdateObject(obj, targetId, mapId);
     }
 
     public string Export(string directory)
@@ -31,17 +31,17 @@ public sealed class InfoTracker
         var export = objects.Values.OrderBy(value => value.Name, StringComparer.OrdinalIgnoreCase).Select(value => new
         {
             value.Key, value.Name, value.Kind, value.EntityId, value.BaseId, value.Targetable, value.Targeted,
-            Position = new { x = value.Position.X, y = value.Position.Y, z = value.Position.Z }
+            Position = new { x = value.Position.X, y = value.Position.Y, z = value.Position.Z, mapId = value.MapId }
         });
         File.WriteAllText(path, JsonSerializer.Serialize(export, new JsonSerializerOptions { WriteIndented = true }));
         return path;
     }
 
-    private void UpdateObject(IGameObject obj, ulong targetId)
+    private void UpdateObject(IGameObject obj, ulong targetId, uint mapId)
     {
         var key = obj.GameObjectId != 0 ? obj.GameObjectId : unchecked((ulong)obj.Address);
         if (!objects.TryGetValue(key, out var state)) objects[key] = state = new InfoObject(key);
-        state.Update(obj, obj.GameObjectId != 0 && obj.GameObjectId == targetId);
+        state.Update(obj, obj.GameObjectId != 0 && obj.GameObjectId == targetId, mapId);
     }
 
     public sealed class InfoObject(ulong key)
@@ -54,8 +54,9 @@ public sealed class InfoTracker
         public bool Targetable { get; private set; }
         public bool Targeted { get; private set; }
         public Vector3 Position { get; private set; }
+        public uint MapId { get; private set; }
 
-        public void Update(IGameObject obj, bool targeted)
+        public void Update(IGameObject obj, bool targeted, uint mapId)
         {
             Name = obj.Name.TextValue;
             Kind = obj.ObjectKind.ToString();
@@ -64,6 +65,7 @@ public sealed class InfoTracker
             Targetable = obj.IsTargetable;
             Targeted = targeted;
             Position = obj.Position;
+            MapId = mapId;
         }
     }
 }

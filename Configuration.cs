@@ -12,7 +12,24 @@ public sealed class ScriptEntry
     [NonSerialized] public string Source = "";
     [NonSerialized] public int Revision;
     [NonSerialized] public bool MissingFileReported;
+    public List<ScriptConfigEntry> Config = new();
+    [NonSerialized] public string ConfigError = "";
 }
+[Serializable]
+public sealed class ScriptConfigEntry
+{
+    public string Key = "";
+    public string Label = "";
+    public ScriptConfigType Type;
+    public List<string> Options = new();
+    public bool BoolValue;
+    public int ComboValue;
+    public string TextValue = "";
+    public float NumberMinimum;
+    public float NumberMaximum;
+    public float NumberValue;
+}
+public enum ScriptConfigType { Checkbox, Combo, Input, Number }
 [Serializable]
 public sealed class InstalledRemoteScript
 {
@@ -24,7 +41,7 @@ public sealed class InstalledRemoteScript
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 3;
+    public int Version { get; set; } = 4;
     public List<ScriptEntry> Scripts = new();
     public List<InstalledRemoteScript> InstalledRemoteScripts = new();
     public void Save() => Plugin.PluginInterface.SavePluginConfig(this);

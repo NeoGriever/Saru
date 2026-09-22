@@ -20,6 +20,9 @@ public sealed class MainWindow : Window
     private IReadOnlyList<RemoteScript>? remoteScripts;
     private readonly Dictionary<string, int> selectedVersions = new(StringComparer.OrdinalIgnoreCase);
     private bool loadingRemoteScripts;
+    private static readonly Vector4 OwnScriptColor = new(0.55f, 0.80f, 1.00f, 1f);
+    private static readonly Vector4 LoadedScriptColor = new(0.55f, 1.00f, 0.65f, 1f);
+    private static readonly Vector4 UpdateAvailableColor = new(1.00f, 0.72f, 0.20f, 1f);
 
     public MainWindow(Plugin plugin) : base("Saru###Saru", ImGuiWindowFlags.NoCollapse)
     {
@@ -72,6 +75,8 @@ public sealed class MainWindow : Window
         {
             ImGui.PushID(script.Id.ToString());
             var running = plugin.IsRunning(script);
+            var hasUpdate = plugin.HasRemoteUpdate(script);
+            var scriptColor = hasUpdate ? UpdateAvailableColor : plugin.IsRemotelyManagedScript(script) ? LoadedScriptColor : OwnScriptColor;
             if (renamingId == script.Id)
             {
                 ImGui.SetNextItemWidth(250);
@@ -87,20 +92,77 @@ public sealed class MainWindow : Window
             }
             else
             {
-                if (running) ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.35f, 0.85f, 0.45f, 1));
-                ImGui.TextUnformatted(script.Name);
+                ImGui.TextColored(scriptColor, script.Name);
                 if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) { renamingId = script.Id; renameText = script.Name; }
-                if (running) ImGui.PopStyleColor();
+                if (hasUpdate) { ImGui.SameLine(); DrawUpdateIcon(); }
                 ImGui.SameLine();
                 ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - (running ? 38 : 40));
                 if (running) { if (ImGui.SmallButton("Stop")) plugin.Stop(script); }
                 else if (ImGui.SmallButton("Play")) plugin.Run(script);
                 ImGui.TextDisabled(plugin.ScriptFullPath(script));
             }
+            DrawScriptConfiguration(script);
             ImGui.PopID();
         }
         if (plugin.Configuration.Scripts.Count == 0) ImGui.TextDisabled("No .js files found.");
         ImGui.EndChild();
+    }
+
+    private void DrawScriptConfiguration(ScriptEntry script)
+    {
+        if (script.Config.Count == 0) return;
+        if (!string.IsNullOrWhiteSpace(script.ConfigError))
+        {
+            ImGui.TextColored(new Vector4(0.95f, 0.35f, 0.35f, 1), "Configuration could not be read");
+            ImGui.TextWrapped(script.ConfigError);
+            return;
+        }
+        if (!ImGui.CollapsingHeader($"Configuration ({script.Config.Count})")) return;
+        var changed = false;
+        foreach (var entry in script.Config)
+        {
+            ImGui.PushID(entry.Key);
+            switch (entry.Type)
+            {
+                case ScriptConfigType.Checkbox:
+                    var boolean = entry.BoolValue;
+                    if (ImGui.Checkbox("##value", ref boolean)) { entry.BoolValue = boolean; changed = true; }
+                    break;
+                case ScriptConfigType.Combo:
+                    if (entry.Options.Count == 0)
+                    {
+                        ImGui.TextDisabled("No options declared");
+                        break;
+                    }
+                    var selection = Math.Clamp(entry.ComboValue, 0, entry.Options.Count - 1);
+                    var options = string.Join("\0", entry.Options) + "\0";
+                    ImGui.SetNextItemWidth(220);
+                    if (ImGui.Combo("##value", ref selection, options)) { entry.ComboValue = selection; changed = true; }
+                    break;
+                case ScriptConfigType.Input:
+                    var text = entry.TextValue;
+                    ImGui.SetNextItemWidth(220);
+                    if (ImGui.InputText("##value", ref text, 512)) { entry.TextValue = text; changed = true; }
+                    break;
+                case ScriptConfigType.Number:
+                    var minimum = (int)MathF.Ceiling(entry.NumberMinimum);
+                    var maximum = (int)MathF.Floor(entry.NumberMaximum);
+                    if (maximum < minimum) maximum = minimum;
+                    var number = Math.Clamp((int)MathF.Round(entry.NumberValue), minimum, maximum);
+                    ImGui.SetNextItemWidth(160);
+                    if (StepInput.InputInt("##value", ref number, 1))
+                    {
+                        entry.NumberValue = Math.Clamp(number, minimum, maximum);
+                        changed = true;
+                    }
+                    break;
+            }
+            ImGui.SameLine(0, 12);
+            ImGui.AlignTextToFramePadding();
+            ImGui.TextWrapped(entry.Label);
+            ImGui.PopID();
+        }
+        if (changed) plugin.SaveConfiguration();
     }
 
     private void DrawLoadScripts()
@@ -125,7 +187,7 @@ public sealed class MainWindow : Window
             try
             {
                 var catalog = await plugin.ScriptRepository.GetCatalogAsync();
-                plugin.QueueMainThread(() => { remoteScripts = catalog; loadingRemoteScripts = false; });
+                plugin.QueueMainThread(() => { plugin.UpdateRemoteCatalog(catalog); remoteScripts = catalog; loadingRemoteScripts = false; });
             }
             catch (Exception ex)
             {
@@ -137,7 +199,13 @@ public sealed class MainWindow : Window
     private void DrawRemoteScript(RemoteScript script)
     {
         ImGui.PushID(script.Name);
+        var installed = plugin.InstalledRemoteScriptVersion(script.Name);
+        var hasUpdate = plugin.HasRemoteUpdate(script.Name);
+        var scriptColor = hasUpdate ? UpdateAvailableColor : installed != null ? LoadedScriptColor : OwnScriptColor;
+        ImGui.PushStyleColor(ImGuiCol.Text, scriptColor);
         var expanded = ImGui.CollapsingHeader(script.Name);
+        ImGui.PopStyleColor();
+        if (hasUpdate) { ImGui.SameLine(); DrawUpdateIcon(); }
         if (!expanded) ImGui.TextDisabled(Preview(script.Description, 70));
         else
         {
@@ -151,9 +219,8 @@ public sealed class MainWindow : Window
         var labels = string.Join("\0", script.Versions.Select(version => version.Timestamp.ToString("MM/dd/yyyy HH:mm", CultureInfo.InvariantCulture))) + "\0";
         ImGui.SetNextItemWidth(190);
         if (ImGui.Combo("Version", ref selected, labels)) selectedVersions[script.Name] = selected;
-        var installed = plugin.InstalledRemoteScriptVersion(script.Name);
         var isInstalled = plugin.IsRemoteScriptInstalled(script.Name);
-        var active = isInstalled && plugin.Configuration.Scripts.Find(value => value.FileName.Equals(script.Name + ".js", StringComparison.OrdinalIgnoreCase)) is { } local && plugin.IsRunning(local);
+        var active = isInstalled && installed != null && plugin.Configuration.Scripts.Find(value => value.FileName.Equals(installed.FileName, StringComparison.OrdinalIgnoreCase)) is { } local && plugin.IsRunning(local);
         ImGui.SameLine();
         if (plugin.IsRemoteScriptLoading(script.Name))
         {
@@ -186,6 +253,12 @@ public sealed class MainWindow : Window
         }
         ImGui.Separator();
         ImGui.PopID();
+    }
+
+    private static void DrawUpdateIcon()
+    {
+        ImGui.TextColored(UpdateAvailableColor, FontAwesomeIcon.ExclamationCircle.ToIconString());
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Update available");
     }
 
     private static string Preview(string markdown, int maximumLength)
@@ -249,7 +322,7 @@ public sealed class MainWindow : Window
 
     private void DrawObject(InfoTracker.InfoObject item, bool isOwnCharacter)
     {
-        var position = string.Create(CultureInfo.InvariantCulture, $"{{ x: {item.Position.X:F4}, y: {item.Position.Y:F4}, z: {item.Position.Z:F4} }}");
+        var position = string.Create(CultureInfo.InvariantCulture, $"{{ x: {item.Position.X:F4}, y: {item.Position.Y:F4}, z: {item.Position.Z:F4}, mapId: {item.MapId} }}");
         ImGui.PushID(item.Key.ToString(CultureInfo.InvariantCulture));
         ImGui.TextUnformatted(string.IsNullOrWhiteSpace(item.Name) ? "Unnamed object" : item.Name);
         ImGui.SameLine();

@@ -23,6 +23,7 @@ using Dalamud.Game.ClientState;
 using Dalamud.Game.ClientState.Keys;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
+using TerritoryTypeSheet = Lumina.Excel.Sheets.TerritoryType;
 using ClientUtf8String = FFXIVClientStructs.FFXIV.Client.System.String.Utf8String;
 using ClientUIModule = FFXIVClientStructs.FFXIV.Client.UI.UIModule;
 namespace Saru;
@@ -51,6 +52,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly ScriptRepository scriptRepository = new();
     private readonly string scriptsPath;
     private readonly HashSet<string> loadingRemoteScripts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, RemoteScriptVersion> latestRemoteVersions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<string> echoes = new();
     private readonly ConcurrentQueue<string> outgoingMessages = new();
     private readonly ConcurrentQueue<ChatMessageRecord> incomingMessages = new();
@@ -60,11 +62,14 @@ public sealed class Plugin : IDalamudPlugin
     private MoveRequest? pendingMove;
     private DateTime nextMoveAttempt;
     private DateTime lastScriptFileCheck = DateTime.MinValue;
+    private DateTime lastRemoteCatalogCheck = DateTime.MinValue;
+    private bool checkingRemoteCatalog;
     private GameStateSnapshot? previousGameState;
     public Configuration Configuration { get; }
     public InfoTracker InfoTracker { get; } = new();
     public string ScriptsPath => scriptsPath;
     public ScriptRepository ScriptRepository => scriptRepository;
+    public uint CurrentMapId => ResolveCurrentMapId();
     public IReadOnlyList<PluginDependencyStatus> Dependencies => GetDependencies();
     public bool RequiredDependenciesAvailable => Dependencies.Where(value => value.IsRequired).All(value => value.IsAvailable);
     public Plugin()
@@ -119,6 +124,7 @@ public sealed class Plugin : IDalamudPlugin
             new("TextAdvance", true, assemblies.Contains("TextAdvance")),
             new("Saucy", true, assemblies.Contains("Saucy")),
             new("Cammy", false, assemblies.Contains("Cammy")),
+            new("Chocoholic", false, assemblies.Contains("Chocoholic")),
         ];
     }
     private unsafe void OnDialogState(AddonEvent type, AddonArgs args)
@@ -141,24 +147,25 @@ public sealed class Plugin : IDalamudPlugin
             Condition[ConditionFlag.InCombat],
             Condition[ConditionFlag.Mounted],
             Condition[ConditionFlag.Jumping],
-            ClientState.MapId,
+            CurrentMapId,
             ClientState.TerritoryType,
             ClientState.Instance,
             ClientState.IsLoggedIn,
             ClientState.IsPvP,
             IsAddonVisible("SelectYesno"),
             IsAddonVisible("RideShootingResult"));
-        foreach (var runtime in runtimes.Values) runtime.UpdatePosition(ObjectTable.LocalPlayer?.Position ?? Vector3.Zero);
+        foreach (var runtime in runtimes.Values) runtime.UpdatePosition(ObjectTable.LocalPlayer?.Position ?? Vector3.Zero, gameState.MapId);
         foreach (var runtime in runtimes.Values) runtime.UpdateGameState(gameState);
         if (previousGameState is { } previous)
         {
+            if (previous.MapId != gameState.MapId) foreach (var runtime in runtimes.Values) runtime.NotifyEvent("mapChange");
             if (!previous.InZoneChange && gameState.InZoneChange) foreach (var runtime in runtimes.Values) runtime.NotifyEvent("zoneChangeStart");
             if (previous.InZoneChange && !gameState.InZoneChange) foreach (var runtime in runtimes.Values) runtime.NotifyEvent("zoneChanged");
             if (previous.BoundByDuty && !gameState.BoundByDuty) foreach (var runtime in runtimes.Values) runtime.NotifyEvent("dutyEnd");
         }
         previousGameState = gameState;
         foreach (var runtime in runtimes.Values) runtime.UpdateObjectPositions();
-        InfoTracker.Update();
+        InfoTracker.Update(gameState.MapId);
         ProcessActivations();
         while (outgoingMessages.TryDequeue(out var outgoing)) ProcessChatMessage(outgoing);
         while (echoes.TryDequeue(out var message))
@@ -167,18 +174,29 @@ public sealed class Plugin : IDalamudPlugin
         if (pendingMove.HasValue && DateTime.UtcNow >= nextMoveAttempt) TryMove(pendingMove.Value, true);
         foreach (var runtime in runtimes.Values) runtime.Update();
         ReloadChangedScriptsIfDue();
+        CheckRemoteScriptUpdatesIfDue();
         while (incomingMessages.TryDequeue(out var incoming)) foreach (var runtime in runtimes.Values) runtime.ReceiveMessage(incoming.Message);
+    }
+    private uint ResolveCurrentMapId()
+    {
+        var reportedMapId = ClientState.MapId;
+        if (reportedMapId != 0) return reportedMapId;
+
+        var territoryId = ClientState.TerritoryType;
+        if (territoryId == 0) return 0;
+        var territories = DataManager.GetExcelSheet<TerritoryTypeSheet>();
+        return territories == null ? 0 : territories.GetRow(territoryId).Map.RowId;
     }
     public string PositionText()
     {
         var p = ObjectTable.LocalPlayer?.Position ?? Vector3.Zero;
-        return string.Create(CultureInfo.InvariantCulture, $"X: {p.X:F4}, Y: {p.Y:F4}, Z: {p.Z:F4}");
+        return string.Create(CultureInfo.InvariantCulture, $"X: {p.X:F4}, Y: {p.Y:F4}, Z: {p.Z:F4}, MapId: {CurrentMapId}");
     }
     public string DescribeTarget(Dalamud.Game.ClientState.Objects.Types.IGameObject? target)
     {
         if (target == null) return "None";
         var p = target.Position;
-        return string.Create(CultureInfo.InvariantCulture, $"Name=\"{target.Name}\" | GameObjectId={target.GameObjectId} | EntityId={target.EntityId} | BaseId={target.BaseId} | Kind={target.ObjectKind} | Targetable={target.IsTargetable} | Position=({p.X:F4}, {p.Y:F4}, {p.Z:F4})");
+        return string.Create(CultureInfo.InvariantCulture, $"Name=\"{target.Name}\" | GameObjectId={target.GameObjectId} | EntityId={target.EntityId} | BaseId={target.BaseId} | Kind={target.ObjectKind} | Targetable={target.IsTargetable} | Position=({p.X:F4}, {p.Y:F4}, {p.Z:F4}, MapId={CurrentMapId})");
     }
     public string CurrentTargetId() => TargetManager.Target?.BaseId.ToString(CultureInfo.InvariantCulture) ?? "null";
     public void Echo(string message) => echoes.Enqueue(message.Replace('\r', ' ').Replace('\n', ' '));
@@ -313,10 +331,15 @@ public sealed class Plugin : IDalamudPlugin
         try { ((AtkUnitBase*)addon.Address)->FireCallbackInt(0); }
         catch (Exception ex) { Write(LogLevel.Error, $"Could not close RideShootingResult: {ex.Message}"); }
     }
-    public bool MoveTo(float x, float y, float z, float buffer)
+    public bool MoveTo(float x, float y, float z, float buffer, uint? mapId)
     {
-        var request = new MoveRequest(new Vector3(x, y, z), Math.Max(0, buffer));
-        foreach (var runtime in runtimes.Values) runtime.TrackMove(request.Target, request.Buffer);
+        if (mapId.HasValue && CurrentMapId != mapId.Value)
+        {
+            Write(LogLevel.Verbose, $"MoveTo ignored: target MapId {mapId.Value} does not match current MapId {CurrentMapId}.");
+            return false;
+        }
+        var request = new MoveRequest(new Vector3(x, y, z), Math.Max(0, buffer), mapId);
+        foreach (var runtime in runtimes.Values) runtime.TrackMove(request.Target, request.Buffer, request.MapId);
         pendingMove = request;
         nextMoveAttempt = DateTime.UtcNow;
         return true;
@@ -326,8 +349,82 @@ public sealed class Plugin : IDalamudPlugin
         try { return PluginInterface.GetIpcSubscriber<bool>("vnavmesh.Path.IsRunning").InvokeFunc(); }
         catch { return false; }
     }
+    public bool ToggleChocoholic(bool enabled)
+    {
+        var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => (value.GetName().Name ?? "").Equals("Chocoholic", StringComparison.OrdinalIgnoreCase));
+        var service = assembly?.GetType("Chocoholic.Services.Service", throwOnError: false);
+        var dutyRestart = service?.GetField("DutyRestart", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+        var enabledField = dutyRestart?.GetType().GetField("Enabled", BindingFlags.Public | BindingFlags.Instance);
+        if (enabledField?.FieldType != typeof(bool))
+            return false;
+        QueueMainThread(() =>
+        {
+            try
+            {
+                if (enabled) ResetChocoholicRegistrationDelay();
+                enabledField.SetValue(dutyRestart, enabled);
+            }
+            catch { }
+            finally
+            {
+                if (!enabled) ReleaseChocoholicForwardInput();
+            }
+        });
+        return true;
+    }
+    private static void ReleaseChocoholicForwardInput()
+    {
+        try
+        {
+            var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => (value.GetName().Name ?? "").Equals("Chocoholic", StringComparison.OrdinalIgnoreCase));
+            var commandType = assembly?.GetType("Chocoholic.Data.ChocoCommand", throwOnError: false);
+            if (commandType != null)
+            {
+                var release = assembly?.GetType("ChocoboRacer.Utility.Utils", throwOnError: false)?.GetMethod("SetKeyState", BindingFlags.NonPublic | BindingFlags.Static, binder: null, types: [commandType, typeof(int)], modifiers: null);
+                if (release != null)
+                {
+                    release.Invoke(null, [Enum.Parse(commandType, "Forward"), 0]);
+                    return;
+                }
+            }
+
+            var ecommons = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => (value.GetName().Name ?? "").Equals("ECommons", StringComparison.OrdinalIgnoreCase));
+            var fallback = ecommons?.GetType("ECommons.Reflection.DalamudReflector", throwOnError: false)?.GetMethod("SetKeyState", BindingFlags.Public | BindingFlags.Static, binder: null, types: [typeof(VirtualKey), typeof(int)], modifiers: null);
+            fallback?.Invoke(null, [VirtualKey.W, 0]);
+        }
+        catch { }
+    }
+    public bool SetChocoholicNumberOfRaces(int numberOfRaces)
+    {
+        var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => (value.GetName().Name ?? "").Equals("Chocoholic", StringComparison.OrdinalIgnoreCase));
+        var config = assembly?.GetType("Chocoholic.ChocoboRacer", throwOnError: false)?.GetField("C", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+        var numberField = config?.GetType().GetField("NumRaces", BindingFlags.Public | BindingFlags.Instance);
+        if (numberField?.FieldType != typeof(int))
+            return false;
+
+        var clampedValue = Math.Clamp(numberOfRaces, 0, 999);
+        QueueMainThread(() =>
+        {
+            try { numberField.SetValue(config, clampedValue); }
+            catch { }
+        });
+        return true;
+    }
+    private static void ResetChocoholicRegistrationDelay()
+    {
+        var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => (value.GetName().Name ?? "").Equals("ECommons", StringComparison.OrdinalIgnoreCase));
+        var reset = assembly?.GetType("ECommons.Throttlers.EzThrottler", throwOnError: false)?.GetMethod("Reset", BindingFlags.Public | BindingFlags.Static, binder: null, types: [typeof(string)], modifiers: null);
+        reset?.Invoke(null, ["RegDelay"]);
+    }
     private bool TryMove(MoveRequest request, bool retry)
     {
+        if (request.MapId.HasValue && CurrentMapId != request.MapId.Value)
+        {
+            pendingMove = null;
+            foreach (var runtime in runtimes.Values) runtime.CancelMove();
+            Write(LogLevel.Verbose, $"MoveTo cancelled: target MapId {request.MapId.Value} no longer matches current MapId {CurrentMapId}.");
+            return false;
+        }
         try
         {
             if (IsNavmeshPathRunning())
@@ -356,9 +453,9 @@ public sealed class Plugin : IDalamudPlugin
     private void InitializeScriptFiles()
     {
         Directory.CreateDirectory(scriptsPath);
-        var changed = Configuration.Version != 3;
+        var changed = Configuration.Version != 4;
         var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var script in Configuration.Scripts)
+        foreach (var script in Configuration.Scripts.ToArray())
         {
             if (script.Name.Equals("Script 1", StringComparison.OrdinalIgnoreCase)) { script.Name = "GSR"; changed = true; }
             var expectedName = ScriptFileName(script.Name);
@@ -389,11 +486,13 @@ public sealed class Plugin : IDalamudPlugin
             script.Source = content.Source;
             script.ContentHash = content.Hash;
             script.Revision++;
+            ScriptConfiguration.Refresh(script);
             changed = true;
         }
 
+        changed |= RemoveMissingLocalScripts();
         SynchronizeScriptDirectory();
-        Configuration.Version = 3;
+        Configuration.Version = 4;
         if (changed) Configuration.Save();
     }
 
@@ -402,17 +501,13 @@ public sealed class Plugin : IDalamudPlugin
         if (DateTime.UtcNow - lastScriptFileCheck < TimeSpan.FromSeconds(2)) return;
         lastScriptFileCheck = DateTime.UtcNow;
         SynchronizeScriptDirectory();
-        var changed = false;
+        var changed = RemoveMissingLocalScripts();
+        RestoreMissingRemoteScripts();
         foreach (var script in Configuration.Scripts)
         {
             var path = ScriptPath(script);
             if (!File.Exists(path))
             {
-                if (!script.MissingFileReported)
-                {
-                    script.MissingFileReported = true;
-                    Write(LogLevel.Error, $"Script file is missing: {script.FileName}");
-                }
                 continue;
             }
             script.MissingFileReported = false;
@@ -425,6 +520,7 @@ public sealed class Plugin : IDalamudPlugin
                 script.ContentHash = content.Hash;
                 script.MissingFileReported = false;
                 script.Revision++;
+                ScriptConfiguration.Refresh(script);
                 changed = true;
                 Write(LogLevel.Verbose, $"Reloaded externally modified script '{script.Name}'.");
                 Echo($"[Saru] Script '{script.Name}' was reloaded.");
@@ -436,9 +532,54 @@ public sealed class Plugin : IDalamudPlugin
 
     private string ScriptPath(ScriptEntry script) => Path.Combine(scriptsPath, script.FileName);
     public string ScriptFullPath(ScriptEntry script) => Path.GetFullPath(ScriptPath(script));
+    private bool IsRemotelyManaged(ScriptEntry script) => Configuration.InstalledRemoteScripts.Exists(value => value.FileName.Equals(script.FileName, StringComparison.OrdinalIgnoreCase));
+    public bool IsRemotelyManagedScript(ScriptEntry script) => IsRemotelyManaged(script);
+    private bool RemoveMissingLocalScripts()
+    {
+        var removed = false;
+        foreach (var script in Configuration.Scripts.Where(value => !File.Exists(ScriptPath(value)) && !IsRemotelyManaged(value)).ToArray())
+        {
+            Stop(script);
+            Configuration.Scripts.Remove(script);
+            removed = true;
+            Write(LogLevel.Verbose, $"Removed missing local script '{script.Name}'.");
+            Echo($"[Saru] Removed missing local script '{script.Name}'.");
+        }
+        return removed;
+    }
     public bool IsRemoteScriptInstalled(string name) => Configuration.InstalledRemoteScripts.Exists(value => value.Name.Equals(name, StringComparison.OrdinalIgnoreCase) && File.Exists(Path.Combine(scriptsPath, value.FileName)));
     public bool IsRemoteScriptLoading(string name) => loadingRemoteScripts.Contains(name);
     public InstalledRemoteScript? InstalledRemoteScriptVersion(string name) => Configuration.InstalledRemoteScripts.Find(value => value.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+    public bool HasRemoteUpdate(ScriptEntry script)
+    {
+        var installed = Configuration.InstalledRemoteScripts.Find(value => value.FileName.Equals(script.FileName, StringComparison.OrdinalIgnoreCase));
+        return installed != null && HasRemoteUpdate(installed.Name);
+    }
+    public bool HasRemoteUpdate(string name) =>
+        InstalledRemoteScriptVersion(name) is { } installed &&
+        latestRemoteVersions.TryGetValue(name, out var latest) &&
+        !latest.Sha.Equals(installed.VersionSha, StringComparison.OrdinalIgnoreCase);
+    public void UpdateRemoteCatalog(IReadOnlyList<RemoteScript> catalog)
+    {
+        latestRemoteVersions.Clear();
+        foreach (var script in catalog)
+            if (script.Versions.Count > 0) latestRemoteVersions[script.Name] = script.Versions[0];
+        lastRemoteCatalogCheck = DateTime.UtcNow;
+    }
+    private void CheckRemoteScriptUpdatesIfDue()
+    {
+        if (checkingRemoteCatalog || DateTime.UtcNow - lastRemoteCatalogCheck < TimeSpan.FromMinutes(30)) return;
+        checkingRemoteCatalog = true;
+        Task.Run(async () =>
+        {
+            try
+            {
+                var catalog = await scriptRepository.GetCatalogAsync();
+                QueueMainThread(() => { UpdateRemoteCatalog(catalog); checkingRemoteCatalog = false; });
+            }
+            catch { QueueMainThread(() => checkingRemoteCatalog = false); }
+        });
+    }
     public void InstallRemoteScript(RemoteScript script, RemoteScriptVersion version)
     {
         if (!loadingRemoteScripts.Add(script.Name)) return;
@@ -527,6 +668,7 @@ public sealed class Plugin : IDalamudPlugin
             script.Source = source;
             script.ContentHash = ReadScriptFile(path).Hash;
             script.Revision++;
+            ScriptConfiguration.Refresh(script);
         }
         catch (Exception ex) { Write(LogLevel.Error, $"Unable to save script '{script.Name}': {ex.Message}"); }
     }
@@ -536,7 +678,7 @@ public sealed class Plugin : IDalamudPlugin
         if (runtimes.TryGetValue(script.Id, out var existing) && existing.IsRunning) return;
         existing?.Dispose();
         Write(LogLevel.Verbose, $"Running script '{script.Name}'.");
-        var runtime = new ScriptRuntime(Write, cardSourceNpcs);
+        var runtime = new ScriptRuntime(Write, cardSourceNpcs, script.Config);
         runtimes[script.Id] = runtime;
         runtime.Run(script.Source);
     }
@@ -595,6 +737,7 @@ public sealed class Plugin : IDalamudPlugin
             var content = ReadScriptFile(Path.Combine(scriptsPath, fileName));
             entry.Source = content.Source;
             entry.ContentHash = content.Hash;
+            ScriptConfiguration.Refresh(entry);
             Configuration.Scripts.Add(entry);
             changed = true;
             Echo($"[Saru] Script erkannt: {name}");
@@ -628,7 +771,7 @@ public sealed class Plugin : IDalamudPlugin
         StopAll();
     }
 }
-public readonly record struct MoveRequest(Vector3 Target, float Buffer);
+public readonly record struct MoveRequest(Vector3 Target, float Buffer, uint? MapId);
 public readonly record struct PluginDependencyStatus(string Name, bool IsRequired, bool IsAvailable);
 public readonly record struct ChatMessageRecord(string Message);
 public readonly record struct ActivationRequest(uint? Id, ulong? Key);

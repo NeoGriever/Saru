@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
@@ -22,6 +23,7 @@ public sealed class ScriptRuntime : IDisposable
     private readonly ConcurrentDictionary<uint, Vector3> objectPositions = new();
     private Vector3? moveTarget;
     private float moveBuffer;
+    private uint? moveMapId;
     private bool dialogVisible;
     private DateTime lastReachCheck = DateTime.MinValue;
     private CancellationTokenSource? cancellation;
@@ -31,7 +33,14 @@ public sealed class ScriptRuntime : IDisposable
     private volatile bool executing;
     public bool IsRunning => active;
     private readonly CardSourceNpcsApi cardSourceNpcs;
-    public ScriptRuntime(Action<LogLevel, string> write, CardSourceNpcsApi cardSourceNpcs) { this.write = write; this.cardSourceNpcs = cardSourceNpcs; Start(); }
+    private readonly ScriptConfigApi configApi;
+    public ScriptRuntime(Action<LogLevel, string> write, CardSourceNpcsApi cardSourceNpcs, IReadOnlyList<ScriptConfigEntry> config)
+    {
+        this.write = write;
+        this.cardSourceNpcs = cardSourceNpcs;
+        configApi = ScriptConfiguration.CreateRuntimeApi(config.Select(ScriptConfiguration.Clone).ToList());
+        Start();
+    }
     public void Start()
     {
         cancellation = new CancellationTokenSource();
@@ -44,6 +53,8 @@ public sealed class ScriptRuntime : IDisposable
         engine.SetValue("vNavMesh", new NavmeshApi());
         engine.SetValue("CardSourceNPCs", cardSourceNpcs);
         engine.SetValue("Saucy", new SaucyApi(cardSourceNpcs));
+        engine.SetValue("chocoholic", new ChocoholicApi());
+        engine.SetValue("saru", configApi);
         engine.SetValue("addEventListener", new Action<string, JsValue>(AddEventListener));
         engine.SetValue("Exit", new Action(Exit));
         engine.SetValue("sendMsg", new Action<string>(Plugin.Instance.SendMessage));
@@ -55,7 +66,7 @@ public sealed class ScriptRuntime : IDisposable
         engine.SetValue("setInterval", new Func<JsValue, double, int>(SetInterval));
         engine.SetValue("clearTimeout", new Action<JsValue>(ClearScheduledValue));
         engine.SetValue("clearInterval", new Action<JsValue>(ClearScheduledValue));
-        engine.Execute("const FFEV = Object.freeze({ message: 'message', dialog: 'dialog', arrived: 'arrived', time: 'time', reach: 'reach', onZoneChanged: 'zoneChanged', onZoneChangeStart: 'zoneChangeStart', onDutyEnd: 'dutyEnd', onEventDone: 'eventDone' }); Object.defineProperty(globalThis, 'curPos', { writable: false, configurable: false }); Object.defineProperty(globalThis, 'inZoneChange', { get: () => __zoneChange.value, configurable: false }); function dist(pos1, pos2) { if (arguments.length === 1 && typeof pos1 === 'number') return __distToId(pos1); const dx = Number(pos1.x) - Number(pos2.x); const dy = Number(pos1.y) - Number(pos2.y); const dz = Number(pos1.z) - Number(pos2.z); return Math.sqrt(dx * dx + dy * dy + dz * dz); }");
+        engine.Execute("const FFEV = Object.freeze({ message: 'message', dialog: 'dialog', arrived: 'arrived', time: 'time', reach: 'reach', onMapChange: 'mapChange', onZoneChanged: 'zoneChanged', onZoneChangeStart: 'zoneChangeStart', onDutyEnd: 'dutyEnd', onEventDone: 'eventDone' }); Object.defineProperty(globalThis, 'curPos', { writable: false, configurable: false }); Object.defineProperty(globalThis, 'inZoneChange', { get: () => __zoneChange.value, configurable: false }); function dist(pos1, pos2) { if (arguments.length === 1 && typeof pos1 === 'number') return __distToId(pos1); const dx = Number(pos1.x) - Number(pos2.x); const dy = Number(pos1.y) - Number(pos2.y); const dz = Number(pos1.z) - Number(pos2.z); return Math.sqrt(dx * dx + dy * dy + dz * dz); }");
         engine.SetValue("True", true);
         engine.SetValue("False", false);
         write(LogLevel.Verbose, "JavaScript runtime started.");
@@ -93,7 +104,7 @@ public sealed class ScriptRuntime : IDisposable
         UpdateScheduledCalls();
         UpdateReaches();
     }
-    public void UpdatePosition(Vector3 position) => currentPosition.Update(position);
+    public void UpdatePosition(Vector3 position, uint mapId) => currentPosition.Update(position, mapId);
     public void UpdateGameState(GameStateSnapshot value) { zoneChange.Update(value.InZoneChange); gameState.Update(value); }
     public void NotifyEvent(string name) { if (engine != null && active && !executing) Dispatch(name); }
     public void UpdateObjectPositions()
@@ -117,7 +128,8 @@ public sealed class ScriptRuntime : IDisposable
         }
         finally { executing = false; }
     }
-    public void TrackMove(Vector3 target, float buffer) { moveTarget = target; moveBuffer = buffer; }
+    public void TrackMove(Vector3 target, float buffer, uint? mapId) { moveTarget = target; moveBuffer = buffer; moveMapId = mapId; }
+    public void CancelMove() { moveTarget = null; moveMapId = null; }
     public void AddTimer(long timestamp) => timers.Add(timestamp);
     public bool RemoveTimer(long timestamp) => timers.Remove(timestamp);
     public bool RemoveTimerAt(int index) { if (index < 0 || index >= timers.Count) return false; timers.RemoveAt(index); return true; }
@@ -152,9 +164,10 @@ public sealed class ScriptRuntime : IDisposable
     private void UpdateMove()
     {
         if (moveTarget == null) return;
+        if (moveMapId.HasValue && currentPosition.mapId != moveMapId.Value) { CancelMove(); return; }
         var player = Plugin.ObjectTable.LocalPlayer;
         if (player == null || Vector3.Distance(player.Position, moveTarget.Value) > moveBuffer) return;
-        moveTarget = null;
+        CancelMove();
         Dispatch("arrived");
     }
     private void UpdateTimers()
@@ -245,12 +258,31 @@ public sealed class ScriptRuntime : IDisposable
     private readonly record struct ReachRequest(uint Id, float Radius);
     private sealed class ScheduledCall(int id, JsValue callback, double delay, bool repeat) { public int Id { get; } = id; public JsValue Callback { get; } = callback; public double Delay { get; } = delay; public bool Repeat { get; } = repeat; public DateTime Next { get; set; } = DateTime.UtcNow.AddMilliseconds(delay); }
     private sealed class TimeApi { public long getTime() => DateTimeOffset.UtcNow.ToUnixTimeSeconds(); }
-    private sealed class PositionApi { private float currentX; private float currentY; private float currentZ; public Vector3 Snapshot => new(Volatile.Read(ref currentX), Volatile.Read(ref currentY), Volatile.Read(ref currentZ)); public void Update(Vector3 value) { Volatile.Write(ref currentX, value.X); Volatile.Write(ref currentY, value.Y); Volatile.Write(ref currentZ, value.Z); } public float x => Volatile.Read(ref currentX); public float y => Volatile.Read(ref currentY); public float z => Volatile.Read(ref currentZ); }
+    private sealed class PositionApi
+    {
+        private float currentX;
+        private float currentY;
+        private float currentZ;
+        private int currentMapId;
+        public Vector3 Snapshot => new(Volatile.Read(ref currentX), Volatile.Read(ref currentY), Volatile.Read(ref currentZ));
+        public void Update(Vector3 value, uint mapId)
+        {
+            Volatile.Write(ref currentX, value.X);
+            Volatile.Write(ref currentY, value.Y);
+            Volatile.Write(ref currentZ, value.Z);
+            Volatile.Write(ref currentMapId, unchecked((int)mapId));
+        }
+        public float x => Volatile.Read(ref currentX);
+        public float y => Volatile.Read(ref currentY);
+        public float z => Volatile.Read(ref currentZ);
+        public uint mapId => unchecked((uint)Volatile.Read(ref currentMapId));
+    }
     private sealed class ZoneChangeApi { private int changing; public bool value => Volatile.Read(ref changing) != 0; public void Update(bool value) => Volatile.Write(ref changing, value ? 1 : 0); }
     private sealed class GameStateApi
     {
         private int zoneChanging, waitForDutyValue, boundByDutyValue, occupiedInQuestEventValue, inDutyQueueValue, inCombatValue, mountedValue, jumpingValue, isLoggedInValue, isPvPValue, selectYesnoOpenValue, rideShootingResultOpenValue;
         private int currentMapValue, territoryIdValue, instanceValue;
+        private readonly MapApi currentMapApi = new();
         public bool inZoneChange => Volatile.Read(ref zoneChanging) != 0;
         public bool waitForDuty => Volatile.Read(ref waitForDutyValue) != 0;
         public bool boundByDuty => Volatile.Read(ref boundByDutyValue) != 0;
@@ -264,23 +296,35 @@ public sealed class ScriptRuntime : IDisposable
         public bool selectYesnoOpen => Volatile.Read(ref selectYesnoOpenValue) != 0;
         public bool rideShootingResultOpen => Volatile.Read(ref rideShootingResultOpenValue) != 0;
         public int currentMap => Volatile.Read(ref currentMapValue);
+        public MapApi map => currentMapApi;
         public int territoryId => Volatile.Read(ref territoryIdValue);
         public int instance => Volatile.Read(ref instanceValue);
         public bool closeRideShootingResult() => Plugin.Instance.CloseRideShootingResult();
         public bool answerYes() => Plugin.Instance.QueueSelectDialog(true);
         public void Update(GameStateSnapshot value)
         {
-            Volatile.Write(ref zoneChanging, value.InZoneChange ? 1 : 0); Volatile.Write(ref waitForDutyValue, value.WaitForDuty ? 1 : 0); Volatile.Write(ref boundByDutyValue, value.BoundByDuty ? 1 : 0); Volatile.Write(ref occupiedInQuestEventValue, value.OccupiedInQuestEvent ? 1 : 0); Volatile.Write(ref inDutyQueueValue, value.InDutyQueue ? 1 : 0); Volatile.Write(ref inCombatValue, value.InCombat ? 1 : 0); Volatile.Write(ref mountedValue, value.Mounted ? 1 : 0); Volatile.Write(ref jumpingValue, value.Jumping ? 1 : 0); Volatile.Write(ref isLoggedInValue, value.IsLoggedIn ? 1 : 0); Volatile.Write(ref isPvPValue, value.IsPvP ? 1 : 0); Volatile.Write(ref selectYesnoOpenValue, value.SelectYesnoOpen ? 1 : 0); Volatile.Write(ref rideShootingResultOpenValue, value.RideShootingResultOpen ? 1 : 0); Volatile.Write(ref currentMapValue, unchecked((int)value.MapId)); Volatile.Write(ref territoryIdValue, unchecked((int)value.TerritoryId)); Volatile.Write(ref instanceValue, unchecked((int)value.Instance));
+            Volatile.Write(ref zoneChanging, value.InZoneChange ? 1 : 0); Volatile.Write(ref waitForDutyValue, value.WaitForDuty ? 1 : 0); Volatile.Write(ref boundByDutyValue, value.BoundByDuty ? 1 : 0); Volatile.Write(ref occupiedInQuestEventValue, value.OccupiedInQuestEvent ? 1 : 0); Volatile.Write(ref inDutyQueueValue, value.InDutyQueue ? 1 : 0); Volatile.Write(ref inCombatValue, value.InCombat ? 1 : 0); Volatile.Write(ref mountedValue, value.Mounted ? 1 : 0); Volatile.Write(ref jumpingValue, value.Jumping ? 1 : 0); Volatile.Write(ref isLoggedInValue, value.IsLoggedIn ? 1 : 0); Volatile.Write(ref isPvPValue, value.IsPvP ? 1 : 0); Volatile.Write(ref selectYesnoOpenValue, value.SelectYesnoOpen ? 1 : 0); Volatile.Write(ref rideShootingResultOpenValue, value.RideShootingResultOpen ? 1 : 0); Volatile.Write(ref currentMapValue, unchecked((int)value.MapId)); currentMapApi.Update(value.MapId); Volatile.Write(ref territoryIdValue, unchecked((int)value.TerritoryId)); Volatile.Write(ref instanceValue, unchecked((int)value.Instance));
         }
     }
+    private sealed class MapApi { private int currentId; public int id => Volatile.Read(ref currentId); public void Update(uint value) => Volatile.Write(ref currentId, unchecked((int)value)); }
     private sealed class TimerApi(ScriptRuntime runtime) { public void At(long timestamp) => runtime.AddTimer(timestamp); public bool Un(long timestamp) => runtime.RemoveTimer(timestamp); public bool UnI(int index) => runtime.RemoveTimerAt(index); }
     private sealed class TargetApi(ScriptRuntime runtime) { public void At(uint id, float radius = 3) => runtime.AddReach(id, radius); public bool Un(uint id) => runtime.RemoveReach(id); public bool Select(uint id) => Plugin.Instance.SelectTarget(id); public bool Activate(uint? id = null) => Plugin.Instance.ActivateTarget(id); }
     private sealed class ConsoleApi(Action<LogLevel, string> write) { public void log(object value) { var message = value?.ToString() ?? "null"; write(LogLevel.Verbose, message); Plugin.Instance.Echo(message); } public void info(object value) => write(LogLevel.Verbose, value?.ToString() ?? "null"); public void error(object value) => write(LogLevel.Error, value?.ToString() ?? "null"); }
     private sealed class DialogApi { public bool Select(JsValue value) => value.IsBoolean() ? Plugin.Instance.SelectDialog(value.AsBoolean()) : value.IsNumber() && value.AsNumber() == 1 ? Plugin.Instance.SelectDialog(true) : value.IsNumber() && value.AsNumber() == 0 ? Plugin.Instance.SelectDialog(false) : false; public bool Y() => Plugin.Instance.SelectDialog(true); public bool N() => Plugin.Instance.SelectDialog(false); }
+    private sealed class ChocoholicApi
+    {
+        public bool Toggle(bool enabled) => Plugin.Instance.ToggleChocoholic(enabled);
+        public bool SetNumberOfRaces(int numberOfRaces) => Plugin.Instance.SetChocoholicNumberOfRaces(numberOfRaces);
+    }
     private sealed class NavmeshApi
     {
         public bool IsRunning() => Plugin.Instance.IsNavmeshPathRunning();
-        public bool MoveTo(float x, float y, float z, float buffer) => Plugin.Instance.MoveTo(x, y, z, buffer);
-        public bool MoveTo(ObjectInstance position, float buffer = 0) => Plugin.Instance.MoveTo((float)position.Get("x").AsNumber(), (float)position.Get("y").AsNumber(), (float)position.Get("z").AsNumber(), buffer);
+        public bool MoveTo(float x, float y, float z, float buffer) => Plugin.Instance.MoveTo(x, y, z, buffer, null);
+        public bool MoveTo(float x, float y, float z, float buffer, uint mapId) => Plugin.Instance.MoveTo(x, y, z, buffer, mapId);
+        public bool MoveTo(ObjectInstance position, float buffer = 0)
+        {
+            var mapId = position.Get("mapId");
+            return Plugin.Instance.MoveTo((float)position.Get("x").AsNumber(), (float)position.Get("y").AsNumber(), (float)position.Get("z").AsNumber(), buffer, mapId.IsNumber() ? (uint)mapId.AsNumber() : null);
+        }
     }
 }
