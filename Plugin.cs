@@ -54,7 +54,6 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IGameInteropProvider GameInteropProvider { get; private set; } = null!;
     private readonly WindowSystem windows = new("Saru");
     private readonly MainWindow mainWindow;
-    private readonly DependencyWindow dependencyWindow;
     private readonly Dictionary<Guid, ScriptRuntime> runtimes = new();
     private readonly CardSourceNpcsApi cardSourceNpcs;
     private readonly ScriptRepository scriptRepository = new();
@@ -88,40 +87,31 @@ public sealed class Plugin : IDalamudPlugin
         InitializeScriptFiles();
         cardSourceNpcs = new CardSourceNpcsApi(DataManager, Write);
         mainWindow = new MainWindow(this);
-        dependencyWindow = new DependencyWindow(this);
         windows.AddWindow(mainWindow);
-        windows.AddWindow(dependencyWindow);
         RestoreMissingRemoteScripts();
         CommandManager.AddHandler("/saru", new CommandInfo(OnCommand) { HelpMessage = "/saru opens Saru. /saru start <scriptname> starts a script. /saru stop stops all scripts." });
         PluginInterface.UiBuilder.Draw += windows.Draw;
-        PluginInterface.UiBuilder.OpenMainUi += OpenMainOrDependencies;
-        PluginInterface.UiBuilder.OpenConfigUi += dependencyWindow.Open;
+        PluginInterface.UiBuilder.OpenMainUi += mainWindow.Open;
+        PluginInterface.UiBuilder.OpenConfigUi += mainWindow.Open;
         Framework.Update += OnUpdate;
         ChatGui.ChatMessage += OnChatMessage;
         AddonLifecycle.RegisterListener(AddonEvent.PostSetup, OnDialogState);
         Write(LogLevel.Verbose, "Saru loaded.");
-        if (!RequiredDependenciesAvailable) dependencyWindow.Open();
     }
     private void OnCommand(string command, string args)
     {
         var parts = args.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length == 2 && parts[0].Equals("start", StringComparison.OrdinalIgnoreCase))
         {
-            if (!RequiredDependenciesAvailable) { dependencyWindow.Open(); return; }
             var script = Configuration.Scripts.Find(value => value.Name.Equals(parts[1], StringComparison.OrdinalIgnoreCase));
             if (script == null) Echo($"[Saru] Script not found: {parts[1]}");
             else Run(script);
             return;
         }
         if (parts.Length == 1 && parts[0].Equals("stop", StringComparison.OrdinalIgnoreCase)) { StopAll(); return; }
-        OpenMainOrDependencies();
+        mainWindow.Open();
     }
     public void OpenMainWindow() => mainWindow.Open();
-    private void OpenMainOrDependencies()
-    {
-        if (RequiredDependenciesAvailable) mainWindow.Open();
-        else dependencyWindow.Open();
-    }
     private static IReadOnlyList<PluginDependencyStatus> GetDependencies()
     {
         var assemblies = AppDomain.CurrentDomain.GetAssemblies().Select(value => value.GetName().Name ?? "").ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -780,8 +770,8 @@ public sealed class Plugin : IDalamudPlugin
         ChatGui.ChatMessage -= OnChatMessage;
         AddonLifecycle.UnregisterListener(AddonEvent.PostSetup, OnDialogState);
         PluginInterface.UiBuilder.Draw -= windows.Draw;
-        PluginInterface.UiBuilder.OpenMainUi -= OpenMainOrDependencies;
-        PluginInterface.UiBuilder.OpenConfigUi -= dependencyWindow.Open;
+        PluginInterface.UiBuilder.OpenMainUi -= mainWindow.Open;
+        PluginInterface.UiBuilder.OpenConfigUi -= mainWindow.Open;
         CommandManager.RemoveHandler("/saru");
         windows.RemoveAllWindows();
         StopAll();

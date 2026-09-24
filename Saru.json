@@ -4,7 +4,7 @@
   "Punchline": "JavaScript automation scripts and collected object information.",
   "Description": "/saru opens the Saru workspace. /saru start <scriptname> starts a script and /saru stop stops all running scripts.",
   "InternalName": "Saru",
-  "AssemblyVersion": "1.0.3.3",
+  "AssemblyVersion": "1.0.3.4",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
   "TestingDalamudApiLevel": 15,

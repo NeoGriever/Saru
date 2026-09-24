@@ -23,6 +23,8 @@ public sealed class MainWindow : Window
     private static readonly Vector4 OwnScriptColor = new(0.55f, 0.80f, 1.00f, 1f);
     private static readonly Vector4 LoadedScriptColor = new(0.55f, 1.00f, 0.65f, 1f);
     private static readonly Vector4 UpdateAvailableColor = new(1.00f, 0.72f, 0.20f, 1f);
+    private static readonly Vector4 RequirementWarningColor = new(1.00f, 0.60f, 0.10f, 1f);
+    private static readonly Vector4 RequirementAvailableColor = new(0.35f, 0.85f, 0.45f, 1f);
 
     public MainWindow(Plugin plugin) : base("Saru###Saru", ImGuiWindowFlags.NoCollapse)
     {
@@ -62,7 +64,31 @@ public sealed class MainWindow : Window
         if (ImGui.BeginTabItem("Scripts")) { DrawScripts(); ImGui.EndTabItem(); }
         if (ImGui.BeginTabItem("Load scripts")) { DrawLoadScripts(); ImGui.EndTabItem(); }
         if (ImGui.BeginTabItem("Information")) { DrawInfos(); ImGui.EndTabItem(); }
+        DrawRequirementsTab();
         ImGui.EndTabBar();
+    }
+
+    private void DrawRequirementsTab()
+    {
+        var requirementsAvailable = plugin.RequiredDependenciesAvailable;
+        if (!requirementsAvailable) ImGui.PushStyleColor(ImGuiCol.Text, RequirementWarningColor);
+        var tabOpen = ImGui.BeginTabItem("Requirements");
+        if (!requirementsAvailable) ImGui.PopStyleColor();
+
+        if (!tabOpen) return;
+
+        ImGui.TextWrapped("Saru continues to run when these plugins are unavailable. Features that use a missing plugin may be unavailable until it is loaded.");
+        ImGui.Spacing();
+        foreach (var dependency in plugin.Dependencies)
+        {
+            var color = dependency.IsAvailable
+                ? RequirementAvailableColor
+                : dependency.IsRequired ? RequirementWarningColor : new Vector4(0.75f, 0.75f, 0.75f, 1f);
+            ImGui.TextColored(color, dependency.IsAvailable ? "Available" : dependency.IsRequired ? "Missing" : "Optional");
+            ImGui.SameLine();
+            ImGui.TextUnformatted(dependency.Name);
+        }
+        ImGui.EndTabItem();
     }
 
     private void DrawScripts()
