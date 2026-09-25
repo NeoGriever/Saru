@@ -93,7 +93,7 @@ public sealed class CardSourceNpcsApi(IDataManager data, Action<LogLevel, string
 
     private object? GetSingleton(string typeName)
     {
-        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies().Reverse())
         {
             var type = assembly.GetType(typeName, throwOnError: false);
             if (type == null)
@@ -198,7 +198,10 @@ public sealed class SaucyMachineApi(string moduleName)
     public bool Toggle(bool enabled)
     {
         if (!SaucyRuntime.IsLoaded())
+        {
+            Plugin.Instance.Write(LogLevel.Error, $"Saucy {moduleName} toggle failed: Saucy configuration is not available.");
             return false;
+        }
         Plugin.Instance.QueueMainThread(() => ToggleOnMainThread(enabled));
         return true;
     }
@@ -212,7 +215,11 @@ public sealed class SaucyMachineApi(string moduleName)
             var isEnabled = configuration.GetType().GetMethod("IsModuleEnabled", BindingFlags.Public | BindingFlags.Instance);
             return isEnabled?.Invoke(configuration, [moduleName]) as bool? ?? false;
         }
-        catch { return false; }
+        catch (Exception ex)
+        {
+            Plugin.Instance.Write(LogLevel.Error, $"Saucy {moduleName} status check failed: {ex.GetBaseException().Message}");
+            return false;
+        }
     }
 
     /// <summary>True only while Saucy exposes an active run state for this machine.</summary>
@@ -224,30 +231,25 @@ public sealed class SaucyMachineApi(string moduleName)
     {
         try
         {
-            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            if (!SaucyRuntime.TryGetConfiguration(out var configuration, out var error))
             {
-                var saucyType = assembly.GetType("Saucy.Saucy", throwOnError: false);
-                if (saucyType == null)
-                    continue;
-
-                var configuration = saucyType.GetProperty("C", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-                if (configuration == null)
-                    return;
-
-                var configurationType = configuration.GetType();
-                var setEnabled = configurationType.GetMethod("SetModuleEnabled", BindingFlags.Public | BindingFlags.Instance);
-                if (setEnabled == null)
-                    return;
-
-                setEnabled.Invoke(configuration, [moduleName, enabled]);
-                configurationType.GetMethod("Save", BindingFlags.Public | BindingFlags.Instance)?.Invoke(configuration, null);
+                Plugin.Instance.Write(LogLevel.Error, $"Saucy {moduleName} toggle failed: {error}");
                 return;
             }
+
+            var configurationType = configuration.GetType();
+            var setEnabled = configurationType.GetMethod("SetModuleEnabled", BindingFlags.Public | BindingFlags.Instance, binder: null, types: [typeof(string), typeof(bool)], modifiers: null);
+            if (setEnabled == null)
+            {
+                Plugin.Instance.Write(LogLevel.Error, $"Saucy {moduleName} toggle failed: {configurationType.FullName}.SetModuleEnabled(string, bool) was not found.");
+                return;
+            }
+
+            setEnabled.Invoke(configuration, [moduleName, enabled]);
+            SaucyRuntime.Save(configuration);
+            Plugin.Instance.Write(LogLevel.Verbose, $"Saucy {moduleName} {(enabled ? "enabled" : "disabled")}.");
         }
-        catch
-        {
-            // Saucy may have been unloaded after the action was queued.
-        }
+        catch (Exception ex) { Plugin.Instance.Write(LogLevel.Error, $"Saucy {moduleName} toggle failed: {ex.GetBaseException().Message}"); }
     }
 }
 
@@ -263,7 +265,11 @@ public sealed class SaucyFixedMatchCountApi(string settingsPropertyName)
     public bool Set(int count)
     {
         if (count <= 0 || !SaucyRuntime.IsLoaded())
+        {
+            if (count <= 0) Plugin.Instance.Write(LogLevel.Error, "Saucy fixed match count must be greater than zero.");
+            else Plugin.Instance.Write(LogLevel.Error, "Saucy fixed match count failed: Saucy configuration is not available.");
             return false;
+        }
         Plugin.Instance.QueueMainThread(() => UpdateOnMainThread(settings =>
             settings.GetType().GetProperty("MatchCount", BindingFlags.Public | BindingFlags.Instance)?.SetValue(settings, count)));
         return true;
@@ -272,26 +278,36 @@ public sealed class SaucyFixedMatchCountApi(string settingsPropertyName)
     private bool QueueUpdate(Action<object> update)
     {
         if (!SaucyRuntime.IsLoaded())
+        {
+            Plugin.Instance.Write(LogLevel.Error, "Saucy fixed match count failed: Saucy configuration is not available.");
             return false;
+        }
         Plugin.Instance.QueueMainThread(() => UpdateOnMainThread(update));
         return true;
     }
 
     private void UpdateOnMainThread(Action<object> update)
     {
-        if (!SaucyRuntime.TryGetConfiguration(out var configuration))
+        if (!SaucyRuntime.TryGetConfiguration(out var configuration, out var error))
+        {
+            Plugin.Instance.Write(LogLevel.Error, $"Saucy fixed match count failed: {error}");
             return;
+        }
         try
         {
             var settings = configuration.GetType().GetProperty(settingsPropertyName, BindingFlags.Public | BindingFlags.Instance)?.GetValue(configuration);
             if (settings == null)
+            {
+                Plugin.Instance.Write(LogLevel.Error, $"Saucy fixed match count failed: {configuration.GetType().FullName}.{settingsPropertyName} was not found.");
                 return;
+            }
             update(settings);
             if (settingsPropertyName is "CuffArcadeRun" or "LimbArcadeRun")
                 SyncActiveSession();
             SaucyRuntime.Save(configuration);
+            Plugin.Instance.Write(LogLevel.Verbose, $"Saucy fixed match count updated for {settingsPropertyName}.");
         }
-        catch { }
+        catch (Exception ex) { Plugin.Instance.Write(LogLevel.Error, $"Saucy fixed match count failed: {ex.GetBaseException().Message}"); }
     }
 
     private static int ReadInt(object source, string property) =>
@@ -302,7 +318,7 @@ public sealed class SaucyFixedMatchCountApi(string settingsPropertyName)
         try
         {
             var saucyAssembly = AppDomain.CurrentDomain.GetAssemblies()
-                .FirstOrDefault(assembly => assembly.GetType("Saucy.GoldSaucerArcadeRunSession", false) != null);
+                .LastOrDefault(assembly => assembly.GetType("Saucy.GoldSaucerArcadeRunSession", false) != null);
             var sessionType = saucyAssembly?.GetType("Saucy.GoldSaucerArcadeRunSession", false);
             var machineType = saucyAssembly?.GetType("Saucy.GoldSaucerArcadeMachine", false);
             if (sessionType == null || machineType == null)
@@ -325,18 +341,31 @@ public sealed class SaucyBooleanSettingApi(string parentPropertyName, string pro
     public bool Toggle(bool enabled)
     {
         if (!SaucyRuntime.IsLoaded())
+        {
+            Plugin.Instance.Write(LogLevel.Error, $"Saucy setting {propertyName} failed: Saucy configuration is not available.");
             return false;
+        }
         Plugin.Instance.QueueMainThread(() =>
         {
-            if (!SaucyRuntime.TryGetConfiguration(out var configuration))
+            if (!SaucyRuntime.TryGetConfiguration(out var configuration, out var error))
+            {
+                Plugin.Instance.Write(LogLevel.Error, $"Saucy setting {propertyName} failed: {error}");
                 return;
+            }
             try
             {
                 var parent = configuration.GetType().GetProperty(parentPropertyName, BindingFlags.Public | BindingFlags.Instance)?.GetValue(configuration);
-                parent?.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance)?.SetValue(parent, enabled);
+                var setting = parent?.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
+                if (setting?.PropertyType != typeof(bool) || !setting.CanWrite)
+                {
+                    Plugin.Instance.Write(LogLevel.Error, $"Saucy setting {propertyName} failed: {parentPropertyName}.{propertyName} was not found or is not writable.");
+                    return;
+                }
+                setting.SetValue(parent, enabled);
                 SaucyRuntime.Save(configuration);
+                Plugin.Instance.Write(LogLevel.Verbose, $"Saucy setting {propertyName} set to {enabled}.");
             }
-            catch { }
+            catch (Exception ex) { Plugin.Instance.Write(LogLevel.Error, $"Saucy setting {propertyName} failed: {ex.GetBaseException().Message}"); }
         });
         return true;
     }
@@ -348,19 +377,45 @@ internal static class SaucyRuntime
     private static DateTime nextMachineStateRefresh;
     public static bool IsLoaded() => TryGetConfiguration(out _);
 
-    public static bool TryGetConfiguration(out object configuration)
+    public static bool TryGetConfiguration(out object configuration) => TryGetConfiguration(out configuration, out _);
+
+    public static bool TryGetConfiguration(out object configuration, out string error)
     {
-        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies().Reverse())
         {
             var saucyType = assembly.GetType("Saucy.Saucy", throwOnError: false);
-            var value = saucyType?.GetProperty("C", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            if (saucyType == null)
+                continue;
+
+            var configurationProperty = saucyType.GetProperty("C", BindingFlags.Public | BindingFlags.Static);
+            if (configurationProperty == null)
+            {
+                configuration = null!;
+                error = "Saucy.Saucy.C was not found.";
+                return false;
+            }
+
+            object? value;
+            try { value = configurationProperty.GetValue(null); }
+            catch (Exception ex)
+            {
+                configuration = null!;
+                error = $"Saucy.Saucy.C could not be read: {ex.GetBaseException().Message}";
+                return false;
+            }
             if (value != null)
             {
                 configuration = value;
+                error = "";
                 return true;
             }
+
+            configuration = null!;
+            error = "Saucy.Saucy.C is not initialized.";
+            return false;
         }
         configuration = null!;
+        error = "Saucy plugin assembly is not loaded.";
         return false;
     }
 
@@ -398,7 +453,7 @@ internal static class SaucyRuntime
 
     private static object? FindModule(string moduleName)
     {
-        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies().Reverse())
         {
             var saucyType = assembly.GetType("Saucy.Saucy", throwOnError: false);
             if (saucyType == null) continue;

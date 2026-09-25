@@ -399,7 +399,7 @@ public sealed class ScriptRuntime : IDisposable
         }
         private Assembly? FindAssembly()
         {
-            var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => string.Equals(value.GetName().Name, name, StringComparison.OrdinalIgnoreCase));
+            var assembly = AppDomain.CurrentDomain.GetAssemblies().LastOrDefault(value => string.Equals(value.GetName().Name, name, StringComparison.OrdinalIgnoreCase));
             if (assembly == null) write(LogLevel.Error, $"Plugin not found: '{name}'.");
             return assembly;
         }

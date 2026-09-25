@@ -31,6 +31,8 @@ namespace Saru;
 public sealed class Plugin : IDalamudPlugin
 {
     private const float InteractionCameraMaximumDistance = 6f;
+    private const int ChocoholicInitializationRetries = 20;
+    private const int ChocoholicInitializationRetryDelayMs = 250;
     [StructLayout(LayoutKind.Explicit, Size = 0x12C)]
     private struct InteractionCamera
     {
@@ -357,32 +359,48 @@ public sealed class Plugin : IDalamudPlugin
     }
     public bool ToggleChocoholic(bool enabled)
     {
-        var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => (value.GetName().Name ?? "").Equals("Chocoholic", StringComparison.OrdinalIgnoreCase));
-        var service = assembly?.GetType("Chocoholic.Services.Service", throwOnError: false);
-        var dutyRestart = service?.GetField("DutyRestart", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-        var enabledField = dutyRestart?.GetType().GetField("Enabled", BindingFlags.Public | BindingFlags.Instance);
-        if (enabledField?.FieldType != typeof(bool))
+        if (FindAssembly("Chocoholic") == null)
+        {
+            Write(LogLevel.Error, "Chocoholic toggle failed: plugin assembly is not loaded.");
             return false;
+        }
+
+        QueueChocoholicToggle(enabled, ChocoholicInitializationRetries);
+        return true;
+    }
+    private void QueueChocoholicToggle(bool enabled, int retriesRemaining)
+    {
         QueueMainThread(() =>
         {
             try
             {
-                if (enabled) ResetChocoholicRegistrationDelay();
-                enabledField.SetValue(dutyRestart, enabled);
+                if (!TrySetChocoholicEnabled(enabled, out var error))
+                {
+                    if (ShouldRetryChocoholicInitialization(error, retriesRemaining))
+                    {
+                        ScheduleChocoholicRetry(() => QueueChocoholicToggle(enabled, retriesRemaining - 1));
+                        return;
+                    }
+                    Write(LogLevel.Error, $"Chocoholic toggle failed: {error}");
+                    return;
+                }
+
+                if (enabled)
+                    ResetChocoholicRegistrationDelay();
+                Write(LogLevel.Verbose, $"Chocoholic racing {(enabled ? "enabled" : "disabled")}.");
             }
-            catch { }
+            catch (Exception ex) { Write(LogLevel.Error, $"Chocoholic toggle failed: {ex.GetBaseException().Message}"); }
             finally
             {
                 if (!enabled) ReleaseChocoholicForwardInput();
             }
         });
-        return true;
     }
     private static void ReleaseChocoholicForwardInput()
     {
         try
         {
-            var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => (value.GetName().Name ?? "").Equals("Chocoholic", StringComparison.OrdinalIgnoreCase));
+            var assembly = FindAssembly("Chocoholic");
             var commandType = assembly?.GetType("Chocoholic.Data.ChocoCommand", throwOnError: false);
             if (commandType != null)
             {
@@ -394,7 +412,7 @@ public sealed class Plugin : IDalamudPlugin
                 }
             }
 
-            var ecommons = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => (value.GetName().Name ?? "").Equals("ECommons", StringComparison.OrdinalIgnoreCase));
+            var ecommons = FindAssembly("ECommons");
             var fallback = ecommons?.GetType("ECommons.Reflection.DalamudReflector", throwOnError: false)?.GetMethod("SetKeyState", BindingFlags.Public | BindingFlags.Static, binder: null, types: [typeof(VirtualKey), typeof(int)], modifiers: null);
             fallback?.Invoke(null, [VirtualKey.W, 0]);
         }
@@ -402,23 +420,99 @@ public sealed class Plugin : IDalamudPlugin
     }
     public bool SetChocoholicNumberOfRaces(int numberOfRaces)
     {
-        var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => (value.GetName().Name ?? "").Equals("Chocoholic", StringComparison.OrdinalIgnoreCase));
-        var config = assembly?.GetType("Chocoholic.ChocoboRacer", throwOnError: false)?.GetField("C", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-        var numberField = config?.GetType().GetField("NumRaces", BindingFlags.Public | BindingFlags.Instance);
-        if (numberField?.FieldType != typeof(int))
+        if (FindAssembly("Chocoholic") == null)
+        {
+            Write(LogLevel.Error, "Chocoholic race count failed: plugin assembly is not loaded.");
             return false;
+        }
 
         var clampedValue = Math.Clamp(numberOfRaces, 0, 999);
+        QueueChocoholicRaceCount(clampedValue, ChocoholicInitializationRetries);
+        return true;
+    }
+    private void QueueChocoholicRaceCount(int count, int retriesRemaining)
+    {
         QueueMainThread(() =>
         {
-            try { numberField.SetValue(config, clampedValue); }
-            catch { }
+            try
+            {
+                if (!TrySetChocoholicRaceCount(count, out var error))
+                {
+                    if (ShouldRetryChocoholicInitialization(error, retriesRemaining))
+                    {
+                        ScheduleChocoholicRetry(() => QueueChocoholicRaceCount(count, retriesRemaining - 1));
+                        return;
+                    }
+                    Write(LogLevel.Error, $"Chocoholic race count failed: {error}");
+                }
+                else
+                    Write(LogLevel.Verbose, $"Chocoholic race count set to {count}.");
+            }
+            catch (Exception ex) { Write(LogLevel.Error, $"Chocoholic race count failed: {ex.GetBaseException().Message}"); }
         });
+    }
+    private bool ShouldRetryChocoholicInitialization(string error, int retriesRemaining)
+    {
+        if (retriesRemaining <= 0 || !error.EndsWith("is not initialized.", StringComparison.Ordinal))
+            return false;
+        if (retriesRemaining == ChocoholicInitializationRetries)
+            Write(LogLevel.Verbose, "Chocoholic is still initializing; waiting up to five seconds before applying the request.");
         return true;
+    }
+    private void ScheduleChocoholicRetry(Action action) => _ = Task.Run(async () =>
+    {
+        await Task.Delay(ChocoholicInitializationRetryDelayMs);
+        QueueMainThread(action);
+    });
+    /// <summary>Reloaded Dalamud plugins can leave their previous AssemblyLoadContext visible.
+    /// The most recently loaded matching assembly is the active plugin instance.</summary>
+    private static Assembly? FindAssembly(string name) => AppDomain.CurrentDomain.GetAssemblies()
+        .LastOrDefault(value => (value.GetName().Name ?? "").Equals(name, StringComparison.OrdinalIgnoreCase));
+    private static bool TrySetChocoholicEnabled(bool enabled, out string error)
+    {
+        var assembly = FindAssembly("Chocoholic");
+        var service = assembly?.GetType("Chocoholic.Services.Service", throwOnError: false);
+        var dutyRestart = service?.GetField("DutyRestart", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null)
+            ?? service?.GetProperty("DutyRestart", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+        if (dutyRestart == null) { error = "Chocoholic.Services.Service.DutyRestart is not initialized."; return false; }
+        return TrySetMember(dutyRestart, "Enabled", enabled, out error);
+    }
+    private static bool TrySetChocoholicRaceCount(int count, out string error)
+    {
+        var assembly = FindAssembly("Chocoholic");
+        var racer = assembly?.GetType("Chocoholic.ChocoboRacer", throwOnError: false);
+        var config = racer?.GetField("C", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null)
+            ?? racer?.GetProperty("C", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+        if (config == null) { error = "Chocoholic.ChocoboRacer.C is not initialized."; return false; }
+        return TrySetMember(config, "NumRaces", count, out error);
+    }
+    private static bool TrySetMember(object target, string name, object value, out string error)
+    {
+        var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        var field = target.GetType().GetField(name, flags);
+        if (field != null)
+        {
+            if (field.FieldType != value.GetType()) { error = $"{target.GetType().FullName}.{name} has unexpected type '{field.FieldType.Name}'."; return false; }
+            field.SetValue(target, value);
+            error = "";
+            return true;
+        }
+
+        var property = target.GetType().GetProperty(name, flags);
+        if (property?.CanWrite == true)
+        {
+            if (property.PropertyType != value.GetType()) { error = $"{target.GetType().FullName}.{name} has unexpected type '{property.PropertyType.Name}'."; return false; }
+            property.SetValue(target, value);
+            error = "";
+            return true;
+        }
+
+        error = $"{target.GetType().FullName}.{name} was not found or is not writable.";
+        return false;
     }
     private static void ResetChocoholicRegistrationDelay()
     {
-        var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(value => (value.GetName().Name ?? "").Equals("ECommons", StringComparison.OrdinalIgnoreCase));
+        var assembly = FindAssembly("ECommons");
         var reset = assembly?.GetType("ECommons.Throttlers.EzThrottler", throwOnError: false)?.GetMethod("Reset", BindingFlags.Public | BindingFlags.Static, binder: null, types: [typeof(string)], modifiers: null);
         reset?.Invoke(null, ["RegDelay"]);
     }
