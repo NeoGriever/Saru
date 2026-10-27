@@ -93,6 +93,7 @@ public sealed class Plugin : IDalamudPlugin
         RestoreMissingRemoteScripts();
         CommandManager.AddHandler("/saru", new CommandInfo(OnCommand) { HelpMessage = "/saru opens Saru. /saru start <scriptname> starts a script. /saru stop stops all scripts." });
         PluginInterface.UiBuilder.Draw += windows.Draw;
+        PluginInterface.UiBuilder.Draw += DrawMarkers;
         PluginInterface.UiBuilder.OpenMainUi += mainWindow.Open;
         PluginInterface.UiBuilder.OpenConfigUi += mainWindow.Open;
         Framework.Update += OnUpdate;
@@ -114,6 +115,12 @@ public sealed class Plugin : IDalamudPlugin
         mainWindow.Open();
     }
     public void OpenMainWindow() => mainWindow.Open();
+    private void DrawMarkers()
+    {
+        if (!ClientState.IsLoggedIn || Condition[ConditionFlag.BetweenAreas]) return;
+        foreach (var runtime in runtimes.Values) runtime.DrawMarkers(ClientState.TerritoryType, ClientState.Instance);
+        mainWindow.DrawInfoMarkers();
+    }
     private static IReadOnlyList<PluginDependencyStatus> GetDependencies()
     {
         var assemblies = AppDomain.CurrentDomain.GetAssemblies().Select(value => value.GetName().Name ?? "").ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -165,7 +172,7 @@ public sealed class Plugin : IDalamudPlugin
         }
         previousGameState = gameState;
         foreach (var runtime in runtimes.Values) runtime.UpdateObjectPositions();
-        InfoTracker.Update(gameState.MapId);
+        InfoTracker.Update(gameState.MapId, gameState.TerritoryId, gameState.Instance);
         ProcessActivations();
         while (outgoingMessages.TryDequeue(out var outgoing)) ProcessChatMessage(outgoing);
         while (echoes.TryDequeue(out var message))
@@ -853,6 +860,8 @@ public sealed class Plugin : IDalamudPlugin
         return name;
     }
     public string ExportInfos() => InfoTracker.Export(PluginInterface.ConfigDirectory.FullName);
+    public int ExportModels(InfoTracker.InfoObject item) => InfoTracker.ExportModels(item, PluginInterface.ConfigDirectory.FullName);
+    public string ModelExportDirectory(InfoTracker.InfoObject item) => Path.Combine(PluginInterface.ConfigDirectory.FullName, "Models", item.Key.ToString(CultureInfo.InvariantCulture));
     public void Write(LogLevel level, string message)
     {
         if (level == LogLevel.Error) Log.Error(message); else Log.Information(message);
@@ -864,6 +873,7 @@ public sealed class Plugin : IDalamudPlugin
         ChatGui.ChatMessage -= OnChatMessage;
         AddonLifecycle.UnregisterListener(AddonEvent.PostSetup, OnDialogState);
         PluginInterface.UiBuilder.Draw -= windows.Draw;
+        PluginInterface.UiBuilder.Draw -= DrawMarkers;
         PluginInterface.UiBuilder.OpenMainUi -= mainWindow.Open;
         PluginInterface.UiBuilder.OpenConfigUi -= mainWindow.Open;
         CommandManager.RemoveHandler("/saru");

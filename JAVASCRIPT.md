@@ -50,6 +50,15 @@ console.log(inZoneChange);
 
 `curPos` is the read-only player position and includes `mapId`. `FFXIV.currentMap` and `FFXIV.map.id` expose the current map ID; use the latter when treating the map as an object. `FFXIV` also exposes `territoryId`, `instance`, `inZoneChange`, `waitForDuty`, `boundByDuty`, `occupiedInQuestEvent`, `inDutyQueue`, `inCombat`, `mounted`, `jumping`, `isLoggedIn`, and `isPvP`.
 
+### World markers
+
+```js
+DrawMarker(12.5, 3.0, -42.75, 1);             // red downward arrow
+DrawMarker(18, 3.0, -40, 1.5, [0, 255, 80]); // green downward arrow
+```
+
+`DrawMarker(x, y, z, scale, [r, g, b])` draws a filled, downward pointing arrow above the given world coordinate. `scale` is its size in world units and must be greater than 0 and at most 100. RGB components are numbers from 0 to 255; omitting the color uses red. Markers remain visible while the script runs in the territory and instance where they were created. Calling `DrawMarker` again at the same coordinates updates the marker; stopping or exiting the script removes its markers. The marker is an ImGui world overlay and can appear over game geometry.
+
 ## Timers, targets, and movement
 
 ```js
@@ -88,6 +97,23 @@ chocoholic.SetNumberOfRaces(1); // set Number of races (clamped to 0–999)
 `Toggle` returns `false` if Chocoholic is not loaded or its compatible activation state is unavailable. Chocoholic currently exposes no general start/stop IPC, so Saru sets the same internal `DutyRestart.Enabled` state that its **Start Racing**/**Stop Racing** button uses through reflection.
 
 `GoldSaucerRunner.js` uses `SetNumberOfRaces(1)` for each queue. Its configurable GATE deadzone does not call `Toggle(false)` and therefore never interrupts a race. Chocoholic is turned off only after the race's MGP payout is detected; the following queue check then leaves it off when the deadzone has begun.
+
+## ContentHelper
+
+When the optional AutoDuty plugin is installed, Saru can launch supported dungeons through Duty Support / Content Helper:
+
+```js
+ContentHelper.ActivateDungeon(123);
+ContentHelper.ActivateDungeon("The Aery");
+
+ContentHelper.IsSupported("The Aery");
+ContentHelper.IsBusy();
+ContentHelper.Stop();
+```
+
+`ActivateDungeon` and `IsSupported` accept either a ContentFinderCondition ID or a dungeon name. Name matching ignores leading/trailing whitespace, letter case, and the difference between an en dash (`–`) and a hyphen (`-`); Saru also checks the English sheet, so English dungeon names work on non-English clients.
+
+Saru resolves the ContentFinderCondition to its TerritoryType, then starts AutoDuty in Duty Support mode. `IsBusy()` remains true from activation through queueing, loading, dungeon execution, and AutoDuty shutdown. AutoDuty is optional, but required when using ContentHelper; unavailable IPC endpoints and unsupported duties simply return `false` without terminating the script.
 
 ## Dynamic plugin integration
 

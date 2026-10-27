@@ -24,6 +24,7 @@ public sealed class ScriptRuntime : IDisposable
     private readonly ZoneChangeApi zoneChange = new();
     private readonly GameStateApi gameState = new();
     private readonly ConcurrentDictionary<uint, Vector3> objectPositions = new();
+    private readonly ConcurrentDictionary<Vector3, WorldMarker> markers = new();
     private Vector3? moveTarget;
     private float moveBuffer;
     private uint? moveMapId;
@@ -57,6 +58,7 @@ public sealed class ScriptRuntime : IDisposable
         engine.SetValue("CardSourceNPCs", cardSourceNpcs);
         engine.SetValue("Saucy", new SaucyApi(cardSourceNpcs));
         engine.SetValue("chocoholic", new ChocoholicApi());
+        engine.SetValue("ContentHelper", new ContentHelperApi(write));
         engine.SetValue("Plugin", new Func<string, PluginApi>(name => new PluginApi(name, write)));
         engine.SetValue("saru", configApi);
         engine.SetValue("addEventListener", new Action<string, JsValue>(AddEventListener));
@@ -66,11 +68,12 @@ public sealed class ScriptRuntime : IDisposable
         engine.SetValue("__zoneChange", zoneChange);
         engine.SetValue("FFXIV", gameState);
         engine.SetValue("__distToId", new Func<uint, double>(DistanceToId));
+        engine.SetValue("__drawMarker", new Action<double, double, double, double, double, double, double>(AddMarker));
         engine.SetValue("setTimeout", new Func<JsValue, double, int>(SetTimeout));
         engine.SetValue("setInterval", new Func<JsValue, double, int>(SetInterval));
         engine.SetValue("clearTimeout", new Action<JsValue>(ClearScheduledValue));
         engine.SetValue("clearInterval", new Action<JsValue>(ClearScheduledValue));
-        engine.Execute("const FFEV = Object.freeze({ message: 'message', dialog: 'dialog', arrived: 'arrived', time: 'time', reach: 'reach', onMapChange: 'mapChange', onZoneChanged: 'zoneChanged', onZoneChangeStart: 'zoneChangeStart', onDutyEnd: 'dutyEnd', onEventDone: 'eventDone' }); Object.defineProperty(globalThis, 'curPos', { writable: false, configurable: false }); Object.defineProperty(globalThis, 'inZoneChange', { get: () => __zoneChange.value, configurable: false }); function dist(pos1, pos2) { if (arguments.length === 1 && typeof pos1 === 'number') return __distToId(pos1); const dx = Number(pos1.x) - Number(pos2.x); const dy = Number(pos1.y) - Number(pos2.y); const dz = Number(pos1.z) - Number(pos2.z); return Math.sqrt(dx * dx + dy * dy + dz * dz); }");
+        engine.Execute("const FFEV = Object.freeze({ message: 'message', dialog: 'dialog', arrived: 'arrived', time: 'time', reach: 'reach', onMapChange: 'mapChange', onZoneChanged: 'zoneChanged', onZoneChangeStart: 'zoneChangeStart', onDutyEnd: 'dutyEnd', onEventDone: 'eventDone' }); Object.defineProperty(globalThis, 'curPos', { writable: false, configurable: false }); Object.defineProperty(globalThis, 'inZoneChange', { get: () => __zoneChange.value, configurable: false }); function dist(pos1, pos2) { if (arguments.length === 1 && typeof pos1 === 'number') return __distToId(pos1); const dx = Number(pos1.x) - Number(pos2.x); const dy = Number(pos1.y) - Number(pos2.y); const dz = Number(pos1.z) - Number(pos2.z); return Math.sqrt(dx * dx + dy * dy + dz * dz); } function DrawMarker(x, y, z, scale, color = [255, 0, 0]) { if (!Array.isArray(color) || color.length !== 3) throw new TypeError('DrawMarker color must be [r, g, b].'); __drawMarker(x, y, z, scale, color[0], color[1], color[2]); }");
         engine.SetValue("True", true);
         engine.SetValue("False", false);
         write(LogLevel.Verbose, "JavaScript runtime started.");
@@ -109,6 +112,23 @@ public sealed class ScriptRuntime : IDisposable
         UpdateReaches();
     }
     public void UpdatePosition(Vector3 position, uint mapId) => currentPosition.Update(position, mapId);
+    public void DrawMarkers(uint territoryId, uint instance)
+    {
+        if (!active || territoryId == 0 || Plugin.ObjectTable.LocalPlayer == null) return;
+        foreach (var marker in markers.Values)
+            if (marker.TerritoryId == territoryId && marker.Instance == instance) WorldMarkerRenderer.Draw(marker);
+    }
+    private void AddMarker(double x, double y, double z, double scale, double r, double g, double b)
+    {
+        if (!double.IsFinite(x) || !double.IsFinite(y) || !double.IsFinite(z) ||
+            !double.IsFinite(scale) || scale <= 0 || scale > 100 ||
+            !double.IsFinite(r) || !double.IsFinite(g) || !double.IsFinite(b) ||
+            r is < 0 or > 255 || g is < 0 or > 255 || b is < 0 or > 255 ||
+            Math.Abs(x) > 100000 || Math.Abs(y) > 100000 || Math.Abs(z) > 100000)
+            throw new ArgumentOutOfRangeException(nameof(scale), "DrawMarker requires finite coordinates, a scale in (0, 100], and RGB values from 0 to 255.");
+        var position = new Vector3((float)x, (float)y, (float)z);
+        markers[position] = new WorldMarker(position, (float)scale, (byte)r, (byte)g, (byte)b, unchecked((uint)gameState.territoryId), unchecked((uint)gameState.instance));
+    }
     public void UpdateGameState(GameStateSnapshot value) { zoneChange.Update(value.InZoneChange); gameState.Update(value); }
     public void NotifyEvent(string name) { if (engine != null && active && !executing) Dispatch(name); }
     public void UpdateObjectPositions()
@@ -257,7 +277,7 @@ public sealed class ScriptRuntime : IDisposable
         var result = engine.Invoke(callback);
         return result.IsBoolean() && result.AsBoolean();
     }
-    private void ClearState() { listeners.Clear(); timers.Clear(); reaches.Clear(); scheduledCalls.Clear(); moveTarget = null; }
+    private void ClearState() { listeners.Clear(); timers.Clear(); reaches.Clear(); scheduledCalls.Clear(); markers.Clear(); moveTarget = null; }
     public void Dispose() { active = false; cancellation?.Cancel(); cancellation?.Dispose(); engine = null; ClearState(); write(LogLevel.Verbose, "JavaScript runtime stopped."); }
     private readonly record struct ReachRequest(uint Id, float Radius);
     private sealed class ScheduledCall(int id, JsValue callback, double delay, bool repeat) { public int Id { get; } = id; public JsValue Callback { get; } = callback; public double Delay { get; } = delay; public bool Repeat { get; } = repeat; public DateTime Next { get; set; } = DateTime.UtcNow.AddMilliseconds(delay); }
