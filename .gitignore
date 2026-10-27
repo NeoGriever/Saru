@@ -1,3 +1,10 @@
 bin/
 obj/
 plugins/
+# Local source backups
+*.cs.bak*
+*.js.bak*
+
+# Local source backups
+*.cs.bak*
+*.js.bak*

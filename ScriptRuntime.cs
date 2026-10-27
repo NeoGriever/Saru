@@ -339,6 +339,8 @@ public sealed class ScriptRuntime : IDisposable
     {
         public bool Toggle(bool enabled) => Plugin.Instance.ToggleChocoholic(enabled);
         public bool SetNumberOfRaces(int numberOfRaces) => Plugin.Instance.SetChocoholicNumberOfRaces(numberOfRaces);
+        public bool StartRacing(int numberOfRaces) => Plugin.Instance.StartChocoholicRacing(numberOfRaces);
+        public bool IsEnabled() => Plugin.Instance.IsChocoholicEnabled();
     }
     private sealed class PluginApi(string name, Action<LogLevel, string> write)
     {

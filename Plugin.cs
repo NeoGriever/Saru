@@ -364,6 +364,56 @@ public sealed class Plugin : IDalamudPlugin
         try { return PluginInterface.GetIpcSubscriber<bool>("vnavmesh.Path.IsRunning").InvokeFunc(); }
         catch { return false; }
     }
+    public bool IsChocoholicEnabled()
+    {
+        try
+        {
+            var assembly = FindAssembly("Chocoholic");
+            var service = assembly?.GetType("Chocoholic.Services.Service", throwOnError: false);
+            var restart = service?.GetField("DutyRestart", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null)
+                ?? service?.GetProperty("DutyRestart", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+            if (restart == null) return false;
+            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            var enabledField = restart.GetType().GetField("Enabled", flags);
+            if (enabledField?.GetValue(restart) is bool fieldValue) return fieldValue;
+            var enabledProperty = restart.GetType().GetProperty("Enabled", flags);
+            return enabledProperty?.GetValue(restart) is bool propertyValue && propertyValue;
+        }
+        catch (Exception ex) { Write(LogLevel.Error, $"Chocoholic status read failed: {ex.GetBaseException().Message}"); return false; }
+    }
+    public bool StartChocoholicRacing(int numberOfRaces)
+    {
+        if (FindAssembly("Chocoholic") == null) return false;
+        var count = Math.Clamp(numberOfRaces, 1, 999);
+        QueueChocoholicStart(count, ChocoholicInitializationRetries);
+        return true;
+    }
+    private void QueueChocoholicStart(int count, int retriesRemaining)
+    {
+        QueueMainThread(() =>
+        {
+            try
+            {
+                if (!TrySetChocoholicRaceCount(count, out var countError))
+                {
+                    if (ShouldRetryChocoholicInitialization(countError, retriesRemaining))
+                        ScheduleChocoholicRetry(() => QueueChocoholicStart(count, retriesRemaining - 1));
+                    else Write(LogLevel.Error, $"Chocoholic start failed (race count): {countError}");
+                    return;
+                }
+                if (!TrySetChocoholicEnabled(true, out var enableError))
+                {
+                    if (ShouldRetryChocoholicInitialization(enableError, retriesRemaining))
+                        ScheduleChocoholicRetry(() => QueueChocoholicStart(count, retriesRemaining - 1));
+                    else Write(LogLevel.Error, $"Chocoholic start failed (enabled): {enableError}");
+                    return;
+                }
+                ResetChocoholicRegistrationDelay();
+                Write(LogLevel.Verbose, $"Chocoholic start applied (races={count}, enabled={IsChocoholicEnabled()}).");
+            }
+            catch (Exception ex) { Write(LogLevel.Error, $"Chocoholic start failed: {ex.GetBaseException().Message}"); }
+        });
+    }
     public bool ToggleChocoholic(bool enabled)
     {
         if (FindAssembly("Chocoholic") == null)
